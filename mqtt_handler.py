@@ -3,9 +3,11 @@ MQTT Handler for Fish Haven Project
 Handles all MQTT communication between ponds
 """
 
-import paho.mqtt.client as mqtt
 import json
+import uuid
 from datetime import datetime
+
+import paho.mqtt.client as mqtt
 
 
 class MQTTHandler:
@@ -18,9 +20,9 @@ class MQTTHandler:
         """
         from config import (
             MQTT_BROKER,
+            MQTT_PASSWORD,
             MQTT_PORT,
             MQTT_USERNAME,
-            MQTT_PASSWORD,
             POND_NAME,
         )
 
@@ -31,7 +33,8 @@ class MQTTHandler:
         self.pond_name = POND_NAME
         self.pond_callback = pond_callback
 
-        self.client = mqtt.Client(client_id=f"pond_{POND_NAME}")
+        unique_id = str(uuid.uuid4())[:8]
+        self.client = mqtt.Client(client_id=f"pond_{POND_NAME}_{unique_id}")
         self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
         # Set callbacks
@@ -46,7 +49,9 @@ class MQTTHandler:
         """Callback when connected to MQTT broker"""
         if rc == 0:
             print(f"✓ Connected to MQTT broker at {self.broker}:{self.port}")
-            was_reconnect = self.connected is False and getattr(self, "reconnect_count", 0) > 0
+            was_reconnect = (
+                self.connected is False and getattr(self, "reconnect_count", 0) > 0
+            )
             self.connected = True
             if was_reconnect:
                 print(f"✓ Reconnected successfully (attempt #{self.reconnect_count})")
@@ -125,7 +130,7 @@ class MQTTHandler:
 
     def announce_pond(self):
         """Announce pond existence to the vivisystem"""
-        from config import TOPIC_ANNOUNCE, POND_NAME, GROUP_NAME
+        from config import GROUP_NAME, POND_NAME, TOPIC_ANNOUNCE
 
         message = {
             "type": "announce",
@@ -140,7 +145,7 @@ class MQTTHandler:
 
     def send_hello(self, target_pond=None):
         """Send hello message"""
-        from config import TOPIC_HELLO, POND_NAME
+        from config import POND_NAME, TOPIC_HELLO
 
         message = {
             "type": "hello",
