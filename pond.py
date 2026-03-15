@@ -4,13 +4,16 @@ GUI-based pond with fish spawning, animation, and migration
 """
 
 import base64
+import json
 import threading
 import time
 import tkinter as tk
+import uuid
 from datetime import datetime
 from io import BytesIO
 from tkinter import messagebox, scrolledtext, ttk
 
+import redis
 from PIL import Image, ImageTk
 from prometheus_client import Counter, Gauge, start_http_server
 
@@ -48,7 +51,7 @@ MQTT_CONNECTED_GAUGE = Gauge(
 
 
 class PondGUI:
-    def __init__(self, root):
+    def __init__(self, root, replica_id=None):
         """Initialize the Pond GUI"""
         self.root = root
         self.root.title(f"Fish Haven - {config.POND_NAME}")
@@ -61,18 +64,138 @@ class PondGUI:
         self.spawn_timer = 0
         self.message_log = []
 
+        # Identity
+        self.replica_id = str(replica_id) if replica_id else str(uuid.uuid4())[:8]
+        self.is_primary = False
+
         # Statistics
         self.stats = {"spawned": 0, "received": 0, "sent": 0, "died": 0}
 
-        # Create UI
+        # 1. Create UI FIRST so the log message box exists!
         self._create_ui()
 
-        # Initialize MQTT
+        # 2. NOW we can set up Redis and log to the UI
+        self.redis_key_fishes = f"pond:{config.GROUP_NAME}:fishes"
+        self.redis_key_lock = f"pond:{config.GROUP_NAME}:primary_lock"
+
+        try:
+            self.redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
+            self.redis.ping()  # Test connection
+            self.log_message(
+                f"Connected to Redis. Replica ID: {self.replica_id}", "SYSTEM"
+            )
+        except Exception as e:
+            self.log_message(f"Redis connection failed: {e}", "ERROR")
+            self.redis = None
+
+        # 3. Initialize MQTT
         self._init_mqtt()
 
         # Start Prometheus metrics server on port 8000
-        start_http_server(8000)
-        self.log_message("Prometheus metrics server started on port 8000", "SYSTEM")
+        # (Note: In a real cluster, you might want to adjust the port dynamically based on replica_id to avoid port collisions on localhost, or just catch the exception)
+        try:
+            from prometheus_client import start_http_server
+
+            start_http_server(8000)
+            self.log_message("Prometheus metrics server started on port 8000", "SYSTEM")
+        except Exception as e:
+            self.log_message(
+                f"Prometheus metrics server could not start (port likely in use): {e}",
+                "WARNING",
+            )
+
+    def maintain_leadership(self):
+        """Try to acquire or extend the Primary lock in Redis"""
+        if not self.redis:
+            self.is_primary = True  # Fallback if Redis is down
+            return
+
+        current_owner = self.redis.get(self.redis_key_lock)
+
+        if current_owner == self.replica_id:
+            # We are the primary, extend the lock's lifespan (2 seconds)
+            self.redis.expire(self.redis_key_lock, 2)
+            self.is_primary = True
+        elif current_owner is None:
+            # No primary exists (or crashed)! Try to grab the lock.
+            # nx=True means "Only set if it doesn't exist"
+            acquired = self.redis.set(
+                self.redis_key_lock, self.replica_id, nx=True, ex=2
+            )
+            self.is_primary = bool(acquired)
+            if self.is_primary:
+                self.log_message("Took over as PRIMARY replica!", "SYSTEM")
+        else:
+            # Someone else has the lock
+            if self.is_primary:
+                self.log_message("Lost primary status, demoting to STANDBY.", "SYSTEM")
+            self.is_primary = False
+
+        # Update UI to show role
+        role_text = "PRIMARY" if self.is_primary else "STANDBY"
+        self.root.title(f"Fish Haven - {config.POND_NAME} [{role_text}]")
+
+    def save_state_to_redis(self):
+        """Primary writes current fish state to Redis"""
+        if not self.redis or not self.is_primary:
+            return
+
+        # Extract full state needed for drawing
+        state = []
+        for fish in self.fishes:
+            state.append(
+                {
+                    "id": fish.fish_id,
+                    "name": fish.name,
+                    "genesis": fish.genesis_pond,
+                    "lifetime": fish.remaining_lifetime,
+                    "x": fish.x,
+                    "y": fish.y,
+                    "current_posture": fish.current_posture,
+                }
+            )
+
+        self.redis.set(self.redis_key_fishes, json.dumps(state))
+
+    def load_state_from_redis(self):
+        """Standby reads fish state from Redis and updates local list"""
+        if not self.redis or self.is_primary:
+            return
+
+        state_str = self.redis.get(self.redis_key_fishes)
+        if not state_str:
+            self.fishes = []
+            return
+
+        try:
+            state = json.loads(state_str)
+            new_fishes = []
+
+            for fish_data in state:
+                # Find existing fish to keep image references intact
+                existing_fish = next(
+                    (f for f in self.fishes if f.fish_id == fish_data["id"]), None
+                )
+
+                if existing_fish:
+                    # Update properties for drawing
+                    existing_fish.x = fish_data["x"]
+                    existing_fish.y = fish_data["y"]
+                    existing_fish.current_posture = fish_data["current_posture"]
+                    existing_fish.remaining_lifetime = fish_data["lifetime"]
+                    new_fishes.append(existing_fish)
+                else:
+                    # It's a new fish we haven't seen yet on this Standby
+                    new_fish = Fish.from_dict(fish_data)
+                    new_fish.x = fish_data["x"]
+                    new_fish.y = fish_data["y"]
+                    new_fish.current_posture = fish_data["current_posture"]
+                    new_fishes.append(new_fish)
+
+            self.fishes = new_fishes
+
+        except Exception as e:
+            print(f"Error loading state from Redis: {e}")
 
     def _create_ui(self):
         """Create the user interface"""
@@ -243,47 +366,49 @@ class PondGUI:
     def pond_loop(self):
         """Main pond simulation loop"""
         while self.running:
-            # Update spawn timer
-            self.spawn_timer += 1
+            # 1. Maintain Heartbeat / Check if we are primary
+            self.maintain_leadership()
 
-            # Auto-spawn fish (max 10 fish limit)
-            if (
-                self.spawn_timer >= config.FISH_SPAWN_INTERVAL * 10
-            ):  # *10 for 0.1s ticks
-                if len(self.fishes) < 10:  # Limit to 10 fish
-                    self.spawn_fish()
-                self.spawn_timer = 0
+            if self.is_primary:
+                # --- THIS IS THE PRIMARY REPLICA ---
+                self.spawn_timer += 1
 
-            # Update all fish
-            fishes_to_remove = []
-            for fish in self.fishes[:]:
-                # Update lifetime
-                if not fish.update_lifetime():
-                    fishes_to_remove.append(fish)
-                    self.stats["died"] += 1
-                    self.log_message(
-                        f"Fish '{fish.name}' died (lifetime expired)", "FISH"
-                    )
-                    continue
+                # Auto-spawn fish
+                if self.spawn_timer >= config.FISH_SPAWN_INTERVAL * 10:
+                    if len(self.fishes) < 10:
+                        self.spawn_fish()
+                    self.spawn_timer = 0
 
-                # Update position
-                fish.update_position(POND_WIDTH, POND_HEIGHT)
+                # Update all fish logic
+                fishes_to_remove = []
+                for fish in self.fishes[:]:
+                    if not fish.update_lifetime():
+                        fishes_to_remove.append(fish)
+                        self.stats["died"] += 1
+                        self.log_message(f"Fish '{fish.name}' died", "FISH")
+                        continue
 
-                # Update animation
-                fish.update_animation()
+                    fish.update_position(config.POND_WIDTH, config.POND_HEIGHT)
+                    fish.update_animation()
 
-                # Check migration
-                pond_crowded = len(self.fishes) > config.MIGRATION_THRESHOLD
-                if fish.should_migrate(pond_crowded):
-                    self.migrate_fish(fish)
-                    fishes_to_remove.append(fish)
+                    pond_crowded = len(self.fishes) > config.MIGRATION_THRESHOLD
+                    if fish.should_migrate(pond_crowded):
+                        self.migrate_fish(fish)
+                        fishes_to_remove.append(fish)
 
-            # Remove dead or migrated fish
-            for fish in fishes_to_remove:
-                if fish in self.fishes:
-                    self.fishes.remove(fish)
+                for fish in fishes_to_remove:
+                    if fish in self.fishes:
+                        self.fishes.remove(fish)
 
-            # Update UI
+                # Save authoritative state to Redis
+                self.save_state_to_redis()
+
+            else:
+                # --- THIS IS A STANDBY REPLICA ---
+                # Do not calculate movement or life. Just mirror the Primary.
+                self.load_state_from_redis()
+
+            # Update UI for everyone
             self.root.after(0, self.update_canvas)
             self.root.after(0, self.update_stats)
 
@@ -301,6 +426,10 @@ class PondGUI:
 
     def spawn_fish_manual(self):
         """Manually spawn a fish"""
+        if not self.is_primary:
+            self.log_message("Ignored: Standby replicas cannot spawn fish.", "SYSTEM")
+            return
+
         if len(self.fishes) < 10:
             self.spawn_fish()
         else:
@@ -309,6 +438,8 @@ class PondGUI:
 
     def receive_fish(self, fish_data, from_pond):
         """Receive a fish from another pond"""
+        if not self.is_primary:
+            return  # Let the Primary handle incoming MQTT messages
         try:
             # Don't receive our own fish
             my_fish_id_prefix = config.POND_NAME + "_"
@@ -460,6 +591,11 @@ def main():
     )
     parser.add_argument(
         "--broker", type=str, help="MQTT broker address (overrides config.py)"
+    )
+    parser.add_argument(
+        "--replica-id",
+        type=str,
+        help="Unique ID for this replica (for Redis primary/standby)",
     )
     args = parser.parse_args()
 

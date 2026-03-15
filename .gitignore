@@ -13,3 +13,5 @@ wheels/
 infra/mosquitto/data/
 infra/mosquitto/log/
 infra/mosquitto/config/passwd
+
+mosquitto
